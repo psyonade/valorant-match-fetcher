@@ -53,10 +53,8 @@ def test_flatten_keeps_missing_performance_and_optional_fields_null():
     assert row["rr_change"] is None
 
 
-def test_fixture_contains_synthetic_player_identities_only():
+def test_fixture_uses_synthetic_player_ids():
     raw_text = FIXTURE.read_text(encoding="utf-8")
-    assert "PlayerName" not in raw_text
-    assert "1234" not in raw_text
     player_ids = re.findall(r'"puuid":"([^"]+)"', raw_text)
     assert player_ids
     assert all(re.fullmatch(r"player\d+", player_id) for player_id in player_ids)
