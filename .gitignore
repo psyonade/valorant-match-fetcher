@@ -2,6 +2,10 @@ data/
 __pycache__/
 .pytest_cache/
 .venv/
+.venv*/
 .uv-cache/
+.uv-python/
 build/
 dist/
+.vscode/
+.env

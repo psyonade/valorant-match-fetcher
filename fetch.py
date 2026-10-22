@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 
 from api import APIError
-from service import FetchOptions, run_fetch
+from service import FetchOptions, run_export_from_cache, run_fetch
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -21,12 +21,16 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--csv", action="store_true", help="Write flattened match data to matches.csv")
     parser.add_argument("--jsonl", action="store_true", help="Write flattened match data to matches.jsonl")
     parser.add_argument("--digest", action="store_true", help="Write compact LLM digest Markdown")
+    parser.add_argument("--manifest", action="store_true", help="Write fetch_manifest.json with query/provenance details")
     parser.add_argument("--rounds", action="store_true", help="Write kill-level events to kills.csv")
+    parser.add_argument("--from-cache", action="store_true", help="Regenerate selected exports offline from data/raw")
     parser.add_argument("--data-dir", type=Path, default=Path("data"), help=argparse.SUPPRESS)
     return parser
 
 
 def run(args: argparse.Namespace) -> int:
+    if args.from_cache and not (args.csv or args.jsonl or args.digest or args.rounds or args.manifest):
+        raise ValueError("--from-cache requires at least one export flag.")
     options = FetchOptions(
         name=args.name,
         tag=args.tag,
@@ -38,10 +42,16 @@ def run(args: argparse.Namespace) -> int:
         export_csv=args.csv,
         export_jsonl=args.jsonl,
         export_digest=args.digest,
+        export_manifest=args.manifest,
         data_dir=args.data_dir,
     )
-    result = run_fetch(options)
-    print(f"Exported {result.match_count} match(es) for act {result.act} to {args.data_dir}.")
+    result = run_export_from_cache(options) if args.from_cache else run_fetch(options)
+    action = "Regenerated exports from cache for" if args.from_cache else "Exported"
+    print(f"{action} {result.match_count} match(es) for act {result.act} to {args.data_dir}.")
+    print(
+        f"Cache hits: {result.cache_hits}; new raw files: {result.new_cache_files}; "
+        f"API pages requested: {result.pages_requested}."
+    )
     if result.null_performance_scores is not None:
         print(f"Matches with null Performance Score: {result.null_performance_scores}")
     if args.csv:
@@ -52,6 +62,14 @@ def run(args: argparse.Namespace) -> int:
         print(f"Exported {result.kill_count} kill event(s) to kills.csv.")
     if args.digest:
         print("Digest: " + ", ".join(str(path) for path in result.digest_paths))
+    if result.manifest_path:
+        print(f"Manifest: {result.manifest_path}")
+    if result.validation_warnings:
+        print(f"Round-data validation warnings: {len(result.validation_warnings)}")
+        for warning in result.validation_warnings[:5]:
+            print(f"- {warning}")
+        if len(result.validation_warnings) > 5:
+            print(f"- ... {len(result.validation_warnings) - 5} more")
     return 0
 
 

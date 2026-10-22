@@ -3,16 +3,22 @@
 from __future__ import annotations
 
 import csv
+import io
 import json
+import os
+import tempfile
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
+from parser import SCHEMA_VERSION
+
 
 CORE_FIELDS = [
-    "match_id", "started_at", "map", "queue", "mode", "season", "game_length_s", "won", "rounds_won",
-    "rounds_lost", "attack_rounds_won", "attack_rounds_played", "defense_rounds_won",
+    "schema_version", "match_id", "started_at", "map", "queue", "mode", "season", "game_length_s", "won", "result",
+    "rounds_won", "rounds_lost", "round_records_total", "rounds_with_valid_result",
+    "round_validation_warning", "attack_rounds_won", "attack_rounds_played", "defense_rounds_won",
     "defense_rounds_played", "agent", "kills", "deaths", "assists", "kd", "damage_dealt",
     "damage_received", "adr", "hs_pct", "headshots", "bodyshots", "legshots", "first_bloods",
     "first_deaths", "plants", "defuses", "multikills_2k", "multikills_3k", "multikills_4k",
@@ -35,7 +41,7 @@ KILL_FIELDS = [
 ]
 SHORT_FIELDS = [
     ("date_utc", "started_at"), ("map", "map"), ("mode", "queue"), ("agent", "agent"),
-    ("W", "won"), ("K", "kills"), ("D", "deaths"), ("A", "assists"), ("K/D", "kd"),
+    ("Result", "result"), ("K", "kills"), ("D", "deaths"), ("A", "assists"), ("K/D", "kd"),
     ("ADR", "adr"), ("HS%", "hs_pct"), ("PS", "perf_score"), ("PS#", "perf_rank_in_match"),
     ("Team#", "perf_rank_in_team"), ("Rank", "rank_tier"), ("FB", "first_bloods"), ("FD", "first_deaths"),
     ("ATK+", "attack_rounds_won"), ("ATK", "attack_rounds_played"), ("DEF+", "defense_rounds_won"),
@@ -44,6 +50,24 @@ SHORT_FIELDS = [
     ("R-", "rounds_lost"), ("match_id", "match_id"),
 ]
 MAX_DIGEST_CHARS = 120_000  # approximately 30k tokens at four characters per token.
+
+
+def _atomic_write_text(path: Path, content: str) -> None:
+    """Replace one output only after its complete contents have been written."""
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", newline="", dir=path.parent,
+            prefix=f".{path.name}.", suffix=".tmp", delete=False,
+        ) as handle:
+            temp_path = Path(handle.name)
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
 
 
 def write_match_exports(
@@ -59,19 +83,23 @@ def write_match_exports(
     output_dir.mkdir(parents=True, exist_ok=True)
     rows = sorted(rows, key=lambda row: row.get("started_at") or "", reverse=True)
     if include_jsonl:
-        with (output_dir / "matches.jsonl").open("w", encoding="utf-8", newline="") as handle:
-            for row in rows:
-                handle.write(json.dumps(row, ensure_ascii=False, separators=(",", ":"), allow_nan=False) + "\n")
+        content = "".join(
+            json.dumps(row, ensure_ascii=False, separators=(",", ":"), allow_nan=False) + "\n"
+            for row in rows
+        )
+        _atomic_write_text(output_dir / "matches.jsonl", content)
     if include_csv:
-        with (output_dir / "matches.csv").open("w", encoding="utf-8", newline="") as handle:
-            writer = csv.DictWriter(handle, fieldnames=MATCH_FIELDS, extrasaction="ignore")
-            writer.writeheader()
-            writer.writerows(rows)
+        handle = io.StringIO(newline="")
+        writer = csv.DictWriter(handle, fieldnames=MATCH_FIELDS, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+        _atomic_write_text(output_dir / "matches.csv", handle.getvalue())
     if include_rounds:
-        with (output_dir / "kills.csv").open("w", encoding="utf-8", newline="") as handle:
-            writer = csv.DictWriter(handle, fieldnames=KILL_FIELDS, extrasaction="ignore")
-            writer.writeheader()
-            writer.writerows(kills)
+        handle = io.StringIO(newline="")
+        writer = csv.DictWriter(handle, fieldnames=KILL_FIELDS, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(kills)
+        _atomic_write_text(output_dir / "kills.csv", handle.getvalue())
 
 
 def _avg(values: Iterable[Any]) -> float | None:
@@ -105,9 +133,16 @@ def _group_table(rows: list[dict[str, Any]], field: str) -> list[list[Any]]:
         groups[str(row.get(field) or "Unknown")].append(row)
     result = []
     for key, games in sorted(groups.items(), key=lambda item: (-len(item[1]), item[0])):
-        wins = sum(row.get("won") is True for row in games)
+        results = [row.get("result") for row in games]
+        wins = sum(value == "win" for value in results)
+        losses = sum(value == "loss" for value in results)
+        draws = sum(value == "draw" for value in results)
+        classified = wins + losses + draws
+        decisive = wins + losses
+        unknown = len(games) - classified
         result.append([
-            key, len(games), _rate(wins, len(games)), _avg(row.get("kd") for row in games),
+            key, len(games), wins, losses, draws, unknown, _rate(wins, classified), _rate(wins, decisive),
+            _avg(row.get("kd") for row in games),
             _avg(row.get("adr") for row in games), _avg(row.get("hs_pct") for row in games),
             _avg(row.get("perf_score") for row in games),
         ])
@@ -116,23 +151,36 @@ def _group_table(rows: list[dict[str, Any]], field: str) -> list[list[Any]]:
 
 def _aggregate_lines(rows: list[dict[str, Any]]) -> list[str]:
     games = len(rows)
-    wins = sum(row.get("won") is True for row in rows)
+    results = [row.get("result") for row in rows]
+    wins = sum(value == "win" for value in results)
+    losses = sum(value == "loss" for value in results)
+    draws = sum(value == "draw" for value in results)
+    classified = wins + losses + draws
+    decisive = wins + losses
+    unknown = games - classified
     rounds = sum((row.get("rounds_won") or 0) + (row.get("rounds_lost") or 0) for row in rows)
     fb = sum(row.get("first_bloods") or 0 for row in rows)
     fd = sum(row.get("first_deaths") or 0 for row in rows)
     mvp = sum(row.get("perf_rank_in_match") == 1 for row in rows)
     lines = ["## Aggregates", "", "### Overall"]
     lines += _table(
-        ["matches", "win_rate_%", "avg_K", "avg_D", "avg_A", "avg_K/D", "avg_ADR", "avg_HS_%",
+        ["matches", "wins", "losses", "draws", "unknown", "win_rate_classified_%", "win_rate_decisive_%",
+         "avg_K", "avg_D", "avg_A", "avg_K/D", "avg_ADR", "avg_HS_%",
          "FB/round", "FD/round", "avg_PS", "MVP_rate_%"],
-        [[games, _rate(wins, games), _avg(r.get("kills") for r in rows), _avg(r.get("deaths") for r in rows),
+        [[games, wins, losses, draws, unknown, _rate(wins, classified), _rate(wins, decisive),
+          _avg(r.get("kills") for r in rows), _avg(r.get("deaths") for r in rows),
           _avg(r.get("assists") for r in rows), _avg(r.get("kd") for r in rows), _avg(r.get("adr") for r in rows),
           _avg(r.get("hs_pct") for r in rows), fb / rounds if rounds else None, fd / rounds if rounds else None,
           _avg(r.get("perf_score") for r in rows), _rate(mvp, games)]],
     )
+    lines.append(
+        "Win rates exclude unknown results: classified = wins / (wins + losses + draws); "
+        "decisive = wins / (wins + losses), excluding draws."
+    )
     for title, field in (("By agent", "agent"), ("By map", "map"), ("By mode", "queue")):
         lines.extend(["", f"### {title}"])
-        lines += _table([field, "games", "win_rate_%", "avg_K/D", "avg_ADR", "avg_HS_%", "avg_PS"],
+        lines += _table([field, "games", "wins", "losses", "draws", "unknown", "win_rate_classified_%",
+                         "win_rate_decisive_%", "avg_K/D", "avg_ADR", "avg_HS_%", "avg_PS"],
                         _group_table(rows, field))
         if field == "map":
             map_groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -156,7 +204,10 @@ def _aggregate_lines(rows: list[dict[str, Any]]) -> list[str]:
         trend.append([
             current.get("started_at"), n, _avg(r.get("perf_score") for r in window),
             _avg(r.get("kd") for r in window), _avg(r.get("adr") for r in window),
-            _rate(sum(r.get("won") is True for r in window), n),
+            _rate(
+                sum(r.get("result") == "win" for r in window),
+                sum(r.get("result") in ("win", "loss", "draw") for r in window),
+            ),
         ])
     trend.reverse()
     lines.extend(["", "### Trailing 10-match trend (newest first; partial windows at start)"])
@@ -169,14 +220,41 @@ def _aggregate_lines(rows: list[dict[str, Any]]) -> list[str]:
         [label, row.get("started_at"), row.get("perf_score"), row.get("agent"), row.get("map"), row.get("match_id")]
         for label, subset in (("best", best), ("worst", worst)) for row in subset
     ])
+    warnings = [row for row in rows if row.get("round_validation_warning")]
+    unchecked = sum(
+        row.get("round_validation_warning") is None
+        and not (
+            row.get("round_records_total") is not None
+            and row.get("rounds_won") is not None
+            and row.get("rounds_lost") is not None
+        )
+        for row in rows
+    )
+    lines.extend(["", "### Round-data validation"])
+    if warnings:
+        lines += _table(["match_id", "round_records_total", "rounds_with_valid_result", "warning"], [
+            [row.get("match_id"), row.get("round_records_total"), row.get("rounds_with_valid_result"),
+             row.get("round_validation_warning")]
+            for row in warnings
+        ])
+    else:
+        lines.append("No mismatch among comparable records.")
+    if unchecked:
+        lines.append(f"{unchecked} match(es) lacked enough round data to compare.")
     return lines
 
 
 def _dictionary_lines() -> list[str]:
     descriptions = {
+        "schema_version": "processed export contract version",
         "match_id": "HenrikDev match identifier", "started_at": "UTC ISO-8601 timestamp", "map": "map name",
         "queue": "HenrikDev queue ID", "mode": "queue ID alias", "season": "season.short act code",
-        "game_length_s": "seconds", "won": "boolean", "rounds_won": "rounds", "rounds_lost": "rounds",
+        "game_length_s": "seconds", "won": "provider Boolean; false may include a draw",
+        "result": "normalized win/loss/draw/unknown; round totals take precedence, ambiguous false is unknown",
+        "rounds_won": "provider-reported rounds won", "rounds_lost": "provider-reported rounds lost",
+        "round_records_total": "number of entries in the raw rounds array; null if absent or malformed",
+        "rounds_with_valid_result": "round records whose winning_team is Blue or Red; null if rounds is absent or malformed",
+        "round_validation_warning": "warning when recognized round winners disagree with provider team totals",
         "attack_rounds_won": "attack rounds won", "attack_rounds_played": "attack rounds observed",
         "defense_rounds_won": "defense rounds won", "defense_rounds_played": "defense rounds observed",
         "agent": "agent name", "kills": "kills", "deaths": "deaths", "assists": "assists", "kd": "kills/deaths",
@@ -206,7 +284,7 @@ def _dictionary_lines() -> list[str]:
             descriptions[f"{side}_avg_{metric}"] = f"mean {subject} {metric}; same units as {metric}"
     lines = ["## Data dictionary", "", *[f"- `{field}`: {descriptions.get(field, 'value')}" for field in MATCH_FIELDS]]
     aliases = {
-        "date_utc": "started_at", "map": "map", "mode": "queue", "agent": "agent", "W": "won",
+        "date_utc": "started_at", "map": "map", "mode": "queue", "agent": "agent", "Result": "result",
         "K": "kills", "D": "deaths", "A": "assists",
         "K/D": "kd", "ADR": "adr", "HS%": "hs_pct", "PS": "perf_score", "PS#": "perf_rank_in_match",
         "Team#": "perf_rank_in_team", "ATK+": "attack_rounds_won", "ATK": "attack_rounds_played",
@@ -236,6 +314,7 @@ def write_digest(
     header = [
         f"# Valorant match digest: {player}", "", f"- Region: {region}", f"- Act: {act}",
         f"- Date range (UTC): {date_range}", f"- Match count: {len(rows)}", f"- Modes included: {mode_text}",
+        f"- Processed schema: {SCHEMA_VERSION}", "- Source: raw HenrikDev match response; derived metrics follow the README definitions.",
         f"- Matches with null Performance Score: {null_ps}",
         f"- Generated: {datetime.now(timezone.utc).isoformat(timespec='seconds')}", "",
     ]
@@ -248,7 +327,7 @@ def write_digest(
     full = prefix + match_lines
     if sum(len(line) + 1 for line in full) <= MAX_DIGEST_CHARS:
         path = output_dir / "llm_digest.md"
-        path.write_text("\n".join(full) + "\n", encoding="utf-8")
+        _atomic_write_text(path, "\n".join(full) + "\n")
         for stale in output_dir.glob("llm_digest_part*.md"):
             stale.unlink()
         return [path]
@@ -272,11 +351,18 @@ def write_digest(
     paths = []
     for index, chunk in enumerate(chunks, 1):
         path = output_dir / f"llm_digest_part{index}.md"
-        path.write_text("\n".join(chunk) + "\n", encoding="utf-8")
+        _atomic_write_text(path, "\n".join(chunk) + "\n")
         paths.append(path)
     for stale in output_dir.glob("llm_digest_part*.md"):
         if stale not in paths:
             stale.unlink()
     (output_dir / "llm_digest.md").unlink(missing_ok=True)
     return paths
+
+
+def write_manifest(output_dir: Path, manifest: dict[str, Any]) -> Path:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    path = output_dir / "fetch_manifest.json"
+    _atomic_write_text(path, json.dumps(manifest, ensure_ascii=False, indent=2, allow_nan=False) + "\n")
+    return path
 

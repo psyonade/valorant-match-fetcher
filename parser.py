@@ -9,6 +9,7 @@ from typing import Any
 PERFORMANCE_COMPONENTS = (
     "damage", "trades", "assists", "utility_usage", "plants", "defuses", "adjusted_kills", "adjusted_deaths"
 )
+SCHEMA_VERSION = "1.0"
 
 
 def _get(value: Any, *path: str, default: Any = None) -> Any:
@@ -91,7 +92,8 @@ def _round_roles(match: dict[str, Any]) -> dict[int, dict[str, str]]:
 
 
 def _average(
-    players: list[dict[str, Any]], metric: str, derived: dict[Any, Counter[str]], has_rounds: bool, has_kills: bool
+    players: list[dict[str, Any]], metric: str, derived: dict[Any, Counter[str]], has_rounds: bool,
+    has_kills: bool, first_deaths_complete: bool,
 ) -> float | None:
     vals: list[float] = []
     for player in players:
@@ -100,7 +102,11 @@ def _average(
             "multikills_4k", "multikills_5k",
         }:
             round_based = metric in {"first_bloods", "plants", "defuses"}
-            val = None if (round_based and not has_rounds) or (not round_based and not has_kills) else float(
+            val = None if (
+                (round_based and not has_rounds)
+                or (not round_based and not has_kills)
+                or (metric == "first_deaths" and not first_deaths_complete)
+            ) else float(
                 derived.get(player.get("puuid"), Counter())[metric]
             )
         elif metric == "perf_score":
@@ -152,6 +158,39 @@ def flatten_match(
     teams = [team for team in (raw.get("teams") or []) if isinstance(team, dict)]
     own_team = next((team for team in teams if team.get("team_id") == mine), {})
     enemy_team = next((team for team in teams if team.get("team_id") != mine), {})
+    rounds_won = _int(_get(own_team, "rounds", "won"))
+    rounds_lost = _int(_get(own_team, "rounds", "lost"))
+    if rounds_won is not None and rounds_lost is not None and rounds_won >= 0 and rounds_lost >= 0:
+        result = "win" if rounds_won > rounds_lost else "loss" if rounds_won < rounds_lost else "draw"
+    elif own_team.get("won") is True:
+        result = "win"
+    elif enemy_team.get("won") is True:
+        result = "loss"
+    else:
+        # A provider Boolean `False` alone cannot distinguish a loss from a draw.
+        result = "unknown"
+
+    raw_rounds = raw.get("rounds")
+    has_round_data = isinstance(raw_rounds, list)
+    round_records_total = len(raw_rounds) if has_round_data else None
+    rounds_with_valid_result = (
+        sum(
+            isinstance(rnd, dict) and rnd.get("winning_team") in ("Blue", "Red")
+            for rnd in raw_rounds
+        )
+        if has_round_data else None
+    )
+    team_round_total = (
+        rounds_won + rounds_lost
+        if rounds_won is not None and rounds_lost is not None and rounds_won >= 0 and rounds_lost >= 0
+        else None
+    )
+    round_validation_warning = None
+    if has_round_data and team_round_total is not None and rounds_with_valid_result != team_round_total:
+        round_validation_warning = (
+            f"round records with a recognized winner ({rounds_with_valid_result}) do not match "
+            f"team round totals ({team_round_total})"
+        )
     own_players = [p for p in players if p.get("team_id") == mine]
     enemy_players = [p for p in players if p.get("team_id") != mine]
     overall_ranks = _ranks(players)
@@ -175,12 +214,14 @@ def flatten_match(
     performance = me.get("performance") or {}
     breakdown = performance.get("breakdown") or {}
     kill_events = [event for event in (raw.get("kills") or []) if isinstance(event, dict)]
-    has_round_data = isinstance(raw.get("rounds"), list)
     has_kill_data = isinstance(raw.get("kills"), list)
     derived: dict[Any, Counter[str]] = {p["puuid"]: Counter() for p in players if p.get("puuid") is not None}
-    my_kills_by_round: Counter[int] = Counter()
-    kills_by_player_round: Counter[tuple[Any, int]] = Counter()
-    first_kill_by_round: dict[int, tuple[int | None, Any]] = {}
+    team_by_id = {p.get("puuid"): p.get("team_id") for p in players if p.get("puuid") is not None}
+    victims_by_player_round: dict[tuple[Any, int], set[Any]] = {}
+    first_death_events_by_round: dict[int, list[tuple[int, Any, bool]]] = {}
+    seen_kill_events: set[tuple[int, Any, Any, int | None]] = set()
+    seen_death_events: set[tuple[int, Any, Any, int | None]] = set()
+    first_deaths_complete = True
     for rnd in raw.get("rounds") or []:
         if not isinstance(rnd, dict):
             continue
@@ -198,20 +239,45 @@ def flatten_match(
         if number is None:
             continue
         killer, victim = _id(event.get("killer")), _id(event.get("victim"))
-        if killer in derived:
-            kills_by_player_round[(killer, number)] += 1
-            if killer == my_id:
-                my_kills_by_round[number] += 1
         moment = _int(event.get("time_in_round_in_ms"))
-        old = first_kill_by_round.get(number)
-        if old is None or (moment is not None and (old[0] is None or moment < old[0])):
-            first_kill_by_round[number] = (moment, victim)
-    for (killer, _), count in kills_by_player_round.items():
+        death_event_key = (number, killer, victim, moment)
+        if victim in derived and death_event_key not in seen_death_events:
+            seen_death_events.add(death_event_key)
+            if moment is None:
+                first_deaths_complete = False
+            else:
+                killer_team, victim_team = team_by_id.get(killer), team_by_id.get(victim)
+                is_opposing_player_kill = (
+                    killer in derived and killer != victim
+                    and killer_team in ("Blue", "Red") and victim_team in ("Blue", "Red")
+                    and killer_team != victim_team
+                )
+                first_death_events_by_round.setdefault(number, []).append((moment, victim, is_opposing_player_kill))
+        # Only player-vs-player events with distinct, known participants can
+        # support conventional kill metrics. Deduplicate exact provider rows.
+        killer_team, victim_team = team_by_id.get(killer), team_by_id.get(victim)
+        if (
+            killer not in derived or victim not in derived or killer == victim
+            or killer_team not in ("Blue", "Red") or victim_team not in ("Blue", "Red")
+            or killer_team == victim_team
+        ):
+            continue
+        event_key = (number, killer, victim, moment)
+        if event_key in seen_kill_events:
+            continue
+        seen_kill_events.add(event_key)
+        victims_by_player_round.setdefault((killer, number), set()).add(victim)
+    for (killer, _), victims in victims_by_player_round.items():
+        count = len(victims)
         if count in (2, 3, 4, 5):
             derived[killer][f"multikills_{count}k"] += 1
-    for _, victim in first_kill_by_round.values():
-        if victim in derived:
-            derived[victim]["first_deaths"] += 1
+    for events in first_death_events_by_round.values():
+        earliest = min(moment for moment, _, _ in events)
+        earliest_events = [(victim, is_opposing) for moment, victim, is_opposing in events if moment == earliest]
+        if len(earliest_events) != 1:
+            first_deaths_complete = False
+        elif earliest_events[0][1]:
+            derived[earliest_events[0][0]]["first_deaths"] += 1
 
     side_stats: dict[str, Any] = {}
     for label, group in (("team", own_players), ("enemy", enemy_players)):
@@ -221,15 +287,20 @@ def flatten_match(
             "multikills_2k", "multikills_3k", "multikills_4k", "multikills_5k", "spent_total", "spent_avg",
             "loadout_avg",
         ):
-            side_stats[f"{label}_avg_{metric}"] = _average(group, metric, derived, has_round_data, has_kill_data)
+            side_stats[f"{label}_avg_{metric}"] = _average(
+                group, metric, derived, has_round_data, has_kill_data, first_deaths_complete
+            )
 
     first_bloods = derived.get(my_id, Counter())["first_bloods"] if has_round_data else None
-    first_deaths = derived.get(my_id, Counter())["first_deaths"] if has_kill_data else None
+    first_deaths = (
+        derived.get(my_id, Counter())["first_deaths"] if has_kill_data and first_deaths_complete else None
+    )
     plants = derived.get(my_id, Counter())["plants"] if has_round_data else None
     defuses = derived.get(my_id, Counter())["defuses"] if has_round_data else None
     own_party = me.get("party_id")
 
     row: dict[str, Any] = {
+        "schema_version": SCHEMA_VERSION,
         "match_id": match_id,
         "started_at": metadata.get("started_at"),
         "map": _get(metadata, "map", "name"),
@@ -239,8 +310,12 @@ def flatten_match(
         "game_length_s": round(_int(metadata.get("game_length_in_ms")) / 1000, 3)
         if _int(metadata.get("game_length_in_ms")) is not None else None,
         "won": own_team.get("won"),
-        "rounds_won": _int(_get(own_team, "rounds", "won")),
-        "rounds_lost": _int(_get(own_team, "rounds", "lost")),
+        "result": result,
+        "rounds_won": rounds_won,
+        "rounds_lost": rounds_lost,
+        "round_records_total": round_records_total,
+        "rounds_with_valid_result": rounds_with_valid_result,
+        "round_validation_warning": round_validation_warning,
         "attack_rounds_won": int(attack_won) if attack_played else None,
         "attack_rounds_played": attack_played or None,
         "defense_rounds_won": int(defense_won) if defense_played else None,
@@ -257,10 +332,10 @@ def flatten_match(
         "headshots": headshots,
         "bodyshots": _int(stats.get("bodyshots")),
         "legshots": _int(stats.get("legshots")),
-        "first_bloods": int(first_bloods),
-        "first_deaths": int(first_deaths),
-        "plants": int(plants),
-        "defuses": int(defuses),
+        "first_bloods": int(first_bloods) if first_bloods is not None else None,
+        "first_deaths": int(first_deaths) if first_deaths is not None else None,
+        "plants": int(plants) if plants is not None else None,
+        "defuses": int(defuses) if defuses is not None else None,
         "multikills_2k": derived.get(my_id, Counter())["multikills_2k"] if has_kill_data else None,
         "multikills_3k": derived.get(my_id, Counter())["multikills_3k"] if has_kill_data else None,
         "multikills_4k": derived.get(my_id, Counter())["multikills_4k"] if has_kill_data else None,

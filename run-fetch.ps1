@@ -8,6 +8,7 @@ param(
     [switch]$Csv,
     [switch]$Jsonl,
     [switch]$Digest,
+    [switch]$Manifest,
     [switch]$Rounds
 )
 
@@ -47,6 +48,9 @@ try {
     }
     if ($Digest) {
         $fetchArgs += "--digest"
+    }
+    if ($Manifest) {
+        $fetchArgs += "--manifest"
     }
     if ($Rounds) {
         $fetchArgs += "--rounds"
